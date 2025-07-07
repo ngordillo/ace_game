@@ -10,6 +10,6 @@ Within the RL code:
 * ```ace_data_funcs.py``` Contains data processing code
 * ```initial_ace_test.py``` Runs ACE2 and feeds it into the custom Gym env
 
-** ACE2
+## ACE2
 
 ACE2 can be found at: https://github.com/ai2cm/ace
