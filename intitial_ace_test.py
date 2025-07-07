@@ -1,14 +1,26 @@
+# ============================
+# Imports
+# ============================
 import copy
+import imp 
 
 import torch
 from torch import nn
 from torch.functional import F
-
+import numpy as np
+import warnings
+np.warnings = warnings  # quiet NumPy warnings
 import gymnasium as gym
+import os
 
+import experiment_settings
 from tqdm import tqdm
 import random
 import register_envs
+
+# ============================
+# Device Configuration
+# ============================
 # # if GPU is to be used
 # device = torch.device(
 #     "cuda" if torch.cuda.is_available() else
@@ -16,21 +28,37 @@ import register_envs
 #     "cpu"
 # )
 
-# if GPU is to be used
-device = torch.device(
-    "cpu"
-)
+# Force GPU use
+device = torch.device("cuda")
 
+print(torch.cuda.is_available())
+# quit()
 
+# ============================
+# Load experiment settings
+# ============================
+EXP_NAME = "falco_test"
+
+imp.reload(experiment_settings)
+settings = experiment_settings.get_settings(EXP_NAME)
+
+DATA_FP = settings['file_path']
+ACE_FP  = settings['ace_path']
+
+# ============================
+# Custom environment wrapper for preprocessing
+# ============================
 class PreProcessEnv(gym.Wrapper):
 
-    def __init__(self, env):
+    def __init__(self, env, fp=None, ace_fp=None):
         gym.Wrapper.__init__(self, env)
-        
-    def step(self, action):
+
+    def step(self, action, fp, episode):
+        self.update_episode(episode)  # dynamic config for this episode
         action = action.item()
         obs, reward, terminated, truncated, info = self.env.step(action)
 
+        # Convert to torch tensors
         obs = torch.from_numpy(obs).unsqueeze(0).float()
         reward = torch.tensor(reward).view(-1, 1)
         terminated = torch.tensor(terminated).view(-1, 1)
@@ -40,13 +68,18 @@ class PreProcessEnv(gym.Wrapper):
 
     def reset(self):
         obs = self.env.reset()
-        # obs = torch.from_numpy(obs[0]).unsqueeze(0).float()
         obs = torch.from_numpy(obs).unsqueeze(0).float()
         return obs
-    
-env = gym.make("ClimateControl-v0")
-env = PreProcessEnv(env)
 
+# ============================
+# Instantiate and wrap environment
+# ============================
+env = gym.make("ClimateControl-v0", fp=DATA_FP, ace_fp=ACE_FP)
+env = PreProcessEnv(env, fp=DATA_FP)
+
+# ============================
+# DQN Model Definition
+# ============================
 class DQNetworkModel(nn.Module):
     def __init__(self, in_channels, out_classes):
         super().__init__()
@@ -61,14 +94,19 @@ class DQNetworkModel(nn.Module):
 
     def forward(self, x):
         return self.layers(x)
-    
-# q_network = DQNetworkModel(env.observation_space.shape[0], env.action_space.n).to(device)
+
+# ============================
+# Instantiate Q-network and target Q-network
+# ============================
+
 q_network = DQNetworkModel(env.observation_space.shape[0], env.action_space.n).to(device)
 
 print(env.action_space.n)
-
 target_q_network = copy.deepcopy(q_network).to(device).eval()
-    
+
+# ============================
+# Replay Memory Class
+# ============================
 class ReplayMemory:
     def __init__(self, capacity=100000):
         self.capacity = capacity
@@ -89,15 +127,20 @@ class ReplayMemory:
         transitions = random.sample(self.memory, batch_size)
         batch = zip(*transitions)
         return [torch.cat([item for item in items]) for items in batch]
-    
+
+# ============================
+# Epsilon-greedy policy
+# ============================
 def policy(state, epsilon):
     if torch.rand(1) < epsilon:
         return torch.randint(env.action_space.n, (1, 1))
     else:
         av = q_network(state).detach()
         return torch.argmax(av, dim=-1, keepdim=True)
-    
 
+# ============================
+# DQN Training Loop
+# ============================
 def dqn_training(
     q_network: DQNetworkModel,
     policy,
@@ -112,60 +155,69 @@ def dqn_training(
     stats = {'MSE Loss': [], 'Returns': [], 'Reward': [], 'Action': []}
     
     for episode in tqdm(range(1, episodes + 1)):
+        # Ensure directory exists for this episode
+        config_dir = '/home/nicojg/ace/configs/' + EXP_NAME + '/episode' + str(episode)
+        if not os.path.exists(config_dir):
+            os.makedirs(config_dir)
+
         state = env.reset()
-        truncated, terminated = False, False # initiate the terminated and truncated flags
+        truncated, terminated = False, False
         ep_return = 0
+
         while not truncated and not terminated:
-            action = policy(state, epsilon) # select action based on epsilon greedy policy
-            print("AHHHHHHHHH")
-            print(action)
+            action = policy(state, epsilon)
             stats['Action'].append(action.item())
-            next_state, reward, truncated, terminated, _ = env.step(action) # take step in environment
-            print("REWARDDDDDDDDDD")
-            print(reward)
+
+            next_state, reward, truncated, terminated, _ = env.step(action, DATA_FP, episode)
             stats['Reward'].append(reward.item())
-            print("REWARDDDDDDDDDD")
-            
-            memory.insert([state, action, reward, truncated,terminated, next_state]) #insert experience into memory
-            
+
+            memory.insert([state, action, reward, truncated, terminated, next_state])
+
             if memory.can_sample(batch_size):
-                state_b, action_b, reward_b, truncated_b,terminated_b, next_state_b = memory.sample(batch_size) # sample a batch of experiences from the memory
-                qsa_b = q_network(state_b).gather(1, action_b) # get q-values for the batch of experiences
-                
-                next_qsa_b = target_q_network(next_state_b) # get q-values for the batch of next_states using the target network
-                next_qsa_b = torch.max(next_qsa_b, dim=-1, keepdim=True)[0] # select the maximum q-value (greedy)
-                
-                target_b = reward_b + ~(truncated_b + terminated_b) * gamma * next_qsa_b # calculate target q-value 
-                
-                loss = F.mse_loss(qsa_b, target_b) # calculate loss between target q-value and predicted q-value
+                # Sample from replay memory
+                state_b, action_b, reward_b, truncated_b, terminated_b, next_state_b = memory.sample(batch_size)
+
+                qsa_b = q_network(state_b).gather(1, action_b)
+                next_qsa_b = target_q_network(next_state_b)
+                next_qsa_b = torch.max(next_qsa_b, dim=-1, keepdim=True)[0]
+
+                # Q-learning update
+                target_b = reward_b + ~(truncated_b + terminated_b) * gamma * next_qsa_b
+                loss = F.mse_loss(qsa_b, target_b)
 
                 q_network.zero_grad()
                 loss.backward()
                 optim.step()
-                
-                stats['MSE Loss'].append(loss)  
-                
+
+                stats['MSE Loss'].append(loss)
+
             state = next_state
             ep_return += reward.item()
-            
-        
-        stats['Returns'].append(ep_return)
 
-        epsilon = max(0, epsilon - 1/10000)
-        
+        stats['Returns'].append(ep_return)
+        epsilon = max(0, epsilon - 1 / 10000)
+
+        # Periodically update the target network
         if episode % 10 == 0:
             target_q_network.load_state_dict(q_network.state_dict())
 
     return stats
 
+# ============================
+# Run Training
+# ============================
+stats = dqn_training(q_network, policy, 10)
 
-stats = dqn_training(q_network,policy,1)
-
+# ============================
+# Output Final Stats
+# ============================
 print(stats['Action'])
 print(stats['Reward'])
 
-
-# env = gym.make("CartPole-v1", render_mode = "human")
+# ============================
+# Optional: run trained policy in human-rendered env
+# ============================
+# env = gym.make("CartPole-v1", render_mode="human")
 # env = PreProcessEnv(env)
 # q_network.eval()
 # for i in range(100):
